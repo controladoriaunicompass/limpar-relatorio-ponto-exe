@@ -155,9 +155,13 @@ def extract_header_positions(header_top, header_bottom):
     """
     Monta um mapa de posições a partir das duas linhas de cabeçalho.
 
-    Exemplo:
-        linha topo:    Dia ... Turno de Trabalho ... Turno Total ... Jornada realizada ... Normais ... Extras ...
-        linha baixo:       Entrada Saída Entrada Saída ... Entrada Saída Entrada Saída ... Diurnas Noturna ...
+    O relatório tem cabeçalhos em duas linhas:
+      - Linha superior: Normais / Extras / Ausências
+      - Linha inferior: Diurnas / Noturna(s)
+
+    Em alguns blocos, o valor aparece uma coluna à direita ou à esquerda do
+    texto do cabeçalho. Por isso gravamos a posição do rótulo e depois buscamos
+    o horário nas colunas vizinhas com prioridade adequada.
     """
     def idx_top(name):
         name = name.lower()
@@ -176,7 +180,6 @@ def extract_header_positions(header_top, header_bottom):
         "ausencias": idx_top("ausências"),
     }
 
-    # Observações costuma estar apenas na linha inferior.
     obs_idx = None
     bh_idx = None
     intrajor_idx = None
@@ -222,8 +225,38 @@ def extract_header_positions(header_top, header_bottom):
     pos["marcacao_indices"] = marcacao_indices
     pos["turno_indices"] = turno_indices
 
-    return pos
+    def label_index_between(start_idx, end_idx, accepted_labels):
+        if start_idx is None:
+            return None
+        if end_idx is None:
+            end_idx = len(header_bottom)
+        for i in range(start_idx, min(end_idx, len(header_bottom))):
+            label = fix_text(header_bottom[i]).lower()
+            if label in accepted_labels:
+                return i
+        return None
 
+    # Valores das colunas de horas, por grupo.
+    pos["normais_diurnas_idx"] = label_index_between(
+        pos.get("normais"), pos.get("extras"), {"diurnas"}
+    )
+    pos["normais_noturna_idx"] = label_index_between(
+        pos.get("normais"), pos.get("extras"), {"noturna", "noturnas"}
+    )
+    pos["extras_diurnas_idx"] = label_index_between(
+        pos.get("extras"), pos.get("ausencias"), {"diurnas"}
+    )
+    pos["extras_noturnas_idx"] = label_index_between(
+        pos.get("extras"), pos.get("ausencias"), {"noturna", "noturnas"}
+    )
+    pos["ausencias_diurnas_idx"] = label_index_between(
+        pos.get("ausencias"), pos.get("intrajor"), {"diurnas"}
+    )
+    pos["ausencias_noturnas_idx"] = label_index_between(
+        pos.get("ausencias"), pos.get("intrajor"), {"noturna", "noturnas"}
+    )
+
+    return pos
 
 def split_date_weekday(value):
     value = fix_text(value)
@@ -265,7 +298,7 @@ def is_continuation_row(row, header_pos):
     for idx in marc_indices:
         if idx < len(row):
             near = get_time_near(row, idx, window=2)
-            if near and near != "--:--":
+            if near and near not in {"--:--", "00:00"}:
                 return True
 
     return False
@@ -276,7 +309,7 @@ def append_markings(record, row, header_pos, max_marcacoes):
     for idx in header_pos.get("marcacao_indices", []):
         if idx < len(row):
             value = get_time_near(row, idx, window=2)
-            if value and is_time(value):
+            if value and is_time(value) and value != "00:00":
                 # Evita repetir a mesma marcação imediatamente se vier duplicada.
                 marcacoes = record.setdefault("_marcacoes", [])
                 if len(marcacoes) < max_marcacoes:
@@ -321,24 +354,27 @@ def get_index_value(row, idx):
     return normalize_empty_time(row[idx])
 
 
-def get_time_near(row, idx, window=1):
+def get_time_near(row, idx, window=2, prefer_next=True):
     """
     Busca horário na coluna do cabeçalho e nas colunas vizinhas.
 
-    No relatório bruto, em alguns blocos o texto Entrada/Saída aparece em uma
-    coluna, mas o horário correspondente vem 1 coluna ao lado.
-    A prioridade é: coluna seguinte, própria coluna, coluna anterior.
+    Para marcações Entrada/Saída, normalmente o horário vem 1 coluna à direita
+    do rótulo. Para totais como Diurnas/Noturna, muitas vezes vem na própria
+    coluna ou 1 coluna à esquerda. O parâmetro prefer_next controla a prioridade.
     """
     if idx is None:
         return ""
 
-    candidates = []
-    for delta in [1, 0, -1, 2, -2]:
-        if abs(delta) <= window or delta in [1, 0, -1]:
-            candidates.append(idx + delta)
+    if prefer_next:
+        deltas = [1, 0, -1, 2, -2]
+    else:
+        deltas = [0, -1, 1, 2, -2]
 
     seen = set()
-    for pos in candidates:
+    for delta in deltas:
+        if abs(delta) > window:
+            continue
+        pos = idx + delta
         if pos in seen:
             continue
         seen.add(pos)
@@ -348,6 +384,16 @@ def get_time_near(row, idx, window=1):
                 return value
     return ""
 
+
+def get_group_time(row, idx):
+    """
+    Busca valores de colunas de totais: Diurnas, Noturna(s), Intrajornada,
+    Interjornada e Banco de Horas.
+
+    Nesses campos, o valor pode ficar exatamente na coluna do cabeçalho,
+    uma coluna antes ou uma coluna depois.
+    """
+    return get_time_near(row, idx, window=2, prefer_next=False)
 
 def finalize_record(record, output_rows, max_marcacoes):
     if not record:
@@ -474,32 +520,16 @@ def limpar_relatorio(input_path, output_path, max_marcacoes=12):
                 "Turno Previsto 2": turno_previsto[1],
                 "Turno Previsto 3": turno_previsto[2],
                 "Turno Previsto 4": turno_previsto[3],
-                "Turno Total": first_real_time_between(
-                    row,
-                    header_pos.get("turno_total", 0),
-                    header_pos.get("jornada_realizada", len(row))
-                ),
-                "Normais Diurnas": first_real_time_between(
-                    row,
-                    max((header_pos.get("normais") or 0) - 1, 0),
-                    header_pos.get("extras", len(row))
-                ),
-                "Normais Noturna": "",
-                "Extras Diurnas": first_real_time_between(
-                    row,
-                    max((header_pos.get("extras") or 0) - 1, 0),
-                    header_pos.get("ausencias", len(row))
-                ),
-                "Extras Noturnas": "",
-                "Ausências Diurnas": first_real_time_between(
-                    row,
-                    max((header_pos.get("ausencias") or 0) - 1, 0),
-                    header_pos.get("intrajor", len(row))
-                ),
-                "Ausências Noturnas": "",
-                "Intrajornada": get_index_value(row, header_pos.get("intrajor")),
-                "Interjornada": get_index_value(row, header_pos.get("interjor")),
-                "Banco de Horas": get_index_value(row, header_pos.get("bh")),
+                "Turno Total": get_group_time(row, header_pos.get("turno_total")),
+                "Normais Diurnas": get_group_time(row, header_pos.get("normais_diurnas_idx")),
+                "Normais Noturna": get_group_time(row, header_pos.get("normais_noturna_idx")),
+                "Extras Diurnas": get_group_time(row, header_pos.get("extras_diurnas_idx")),
+                "Extras Noturnas": get_group_time(row, header_pos.get("extras_noturnas_idx")),
+                "Ausências Diurnas": get_group_time(row, header_pos.get("ausencias_diurnas_idx")),
+                "Ausências Noturnas": get_group_time(row, header_pos.get("ausencias_noturnas_idx")),
+                "Intrajornada": get_group_time(row, header_pos.get("intrajor")),
+                "Interjornada": get_group_time(row, header_pos.get("interjor")),
+                "Banco de Horas": get_group_time(row, header_pos.get("bh")),
                 "Observações": extract_observacoes(row, header_pos),
                 "Linha Original": line_number,
             }
