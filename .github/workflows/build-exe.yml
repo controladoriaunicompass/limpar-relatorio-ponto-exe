@@ -1,0 +1,29 @@
+name: Gerar EXE Windows
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Baixar arquivos do repositorio
+        uses: actions/checkout@v4
+
+      - name: Instalar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Instalar PyInstaller
+        run: python -m pip install pyinstaller
+
+      - name: Gerar EXE
+        run: pyinstaller --onefile --console --name "Limpar_Relatorio_Ponto" "limpar_relatorio_ponto_auto.py"
+
+      - name: Enviar EXE como artefato
+        uses: actions/upload-artifact@v4
+        with:
+          name: Limpar_Relatorio_Ponto_EXE
+          path: dist/Limpar_Relatorio_Ponto.exe
